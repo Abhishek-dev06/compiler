@@ -1,0 +1,14 @@
+.java-file-note {
+  margin: 0;
+  padding: .55rem .85rem;
+  background: rgba(96, 165, 250, .09);
+  border-bottom: 1px solid #263246;
+  color: #b9cff1;
+  font-size: .78rem;
+  line-height: 1.45;
+}
+
+.java-file-note code {
+  color: #d9e8ff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10151f">
+  <title>CodeRun — Online Compiler</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='java-note.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="CodeRun home"><span class="brand-mark">&gt;_</span> CodeRun</a>
+    <span class="tagline">Online Compiler <span aria-hidden="true">·</span> Execution History</span>
+    <button id="history-toggle" class="icon-button mobile-only" aria-label="Toggle execution history">☰</button>
+  </header>
+  <main class="app-shell">
+    <aside id="history-panel" class="history-panel" aria-label="Execution history">
+      <div class="panel-heading"><div><p class="eyebrow">Local SQLite</p><h2>Run history</h2></div><span id="history-count" class="count">0</span></div>
+      <p id="history-empty" class="empty-message">Your runs will appear here.</p>
+      <div id="history-list" class="history-list"></div>
+    </aside>
+    <section class="workspace">
+      <div class="editor-card card">
+        <div class="editor-toolbar">
+          <div class="select-wrap"><label class="sr-only" for="language">Language</label><select id="language">
+            {% for key, info in languages.items() %}<option value="{{ key }}">{{ info.name }}</option>{% endfor %}
+          </select></div>
+          <span id="editor-state" class="shortcut">Ctrl + Enter to run</span>
+          <button id="run-button" class="run-button"><span aria-hidden="true">▶</span> Run code</button>
+        </div>
+        <p id="java-file-note" class="java-file-note" hidden>CodeRun runs <code>public class Main</code> directly. For another public Java class such as <code>ArrayStack&lt;T&gt;</code>, it securely uses Judge0 multi-file mode to create the matching <code>.java</code> filename when the configured Judge0 service supports it.</p>
+        <div id="editor" aria-label="Code editor"></div>
+      </div>
+      <div class="lower-grid">
+        <section class="card input-card">
+          <div class="section-title"><div><p class="eyebrow">Standard input</p><h2>Custom input</h2></div><span>optional</span></div>
+          <label class="sr-only" for="stdin">Text provided to your program</label>
+          <textarea id="stdin" spellcheck="false" placeholder="Enter input for your program here…"></textarea>
+        </section>
+        <section class="card output-card">
+          <div class="section-title"><div><p class="eyebrow">Terminal</p><h2 id="output-title">Output</h2></div><span id="status-badge" class="status neutral">Ready</span></div>
+          <div id="metrics" class="metrics" hidden></div>
+          <pre id="output" aria-live="polite">Run your code to see its output.</pre>
+        </section>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script>window.CODERUN_LANGUAGES = {{ languages | tojson }}; window.MONACO_VS_PATH = {{ url_for('static', filename='vendor/monaco/vs') | tojson }};</script>
+  <script src="{{ url_for('static', filename='vendor/monaco/vs/loader.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
