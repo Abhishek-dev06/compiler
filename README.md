@@ -7,7 +7,7 @@ CodeRun is a dark, responsive Flask web application that uses **Judge0 CE** to c
 - Locally bundled Monaco code editor (no browser-side CDN dependency), language selector, custom standard input, terminal output, and execution metrics.
 - Python 3 (Judge0 ID 71), C GCC (50), C++ G++ (54), and Java. Java `public class Main` uses ID 62; other top-level public Java classes use Judge0's verified multi-file runner.
 - Asynchronous Judge0 submit-and-poll protocol using Judge0's Base64 mode, preserving UTF-8 code (including Java generics) across the API boundary, plus remote timeout and API failure handling.
-- SQLite-backed history that survives refreshes and backend restarts.
+- Accounts: guests can run code; signed-in users get a private, SQLite-backed run history that survives refreshes and restarts.
 - Restore source/input/output from a historical run and delete individual records.
 - Server-side environment configuration; browser code receives no Judge0 credentials.
 
@@ -28,13 +28,31 @@ Open http://127.0.0.1:5000.
 
 The default `.env.example` points at the public Judge0 CE instance. For a reliable production deployment, set `JUDGE0_API_URL` to a Judge0 CE deployment you control and, if it requires authentication, set `JUDGE0_AUTH_TOKEN` and/or `JUDGE0_AUTH_USER`. (`JUDGE0_API_KEY` is accepted as a token alias.) These values are read only on the backend. The default database is `coderun.db` next to `app.py`; set `DATABASE_PATH` for another persistent location.
 
+## Accounts, CSRF and sessions
+
+- **Guests** can run code, but runs are not saved. The history panel shows a sign-in prompt instead of an error.
+- **Signed-in users** (`/register`, `/login`) get a private run history. Every history query is scoped to the signed-in user, so one account can never read or delete another's runs.
+- **CSRF**: every `POST/PUT/PATCH/DELETE` must carry the session's token in an `X-CSRFToken` header (or a `csrf_token` form field). Pages embed it as `<meta name="csrf-token">`; `static/app.js` sends it automatically, and if the session expired while a tab was open it fetches a new token from `GET /api/csrf` and retries once.
+- **Sessions**: cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` in production. Logging in or registering starts a fresh session and a fresh CSRF token.
+
+### Production (Render)
+
+Set these environment variables on the service. `gunicorn app:app --bind 0.0.0.0:$PORT` is unchanged.
+
+| Variable | Value |
+| --- | --- |
+| `SECRET_KEY` | **Required.** A long random string (`python -c "import secrets; print(secrets.token_hex(32))"`). The app refuses to start in production without it. |
+| `DATABASE_PATH` | Recommended: a path on a persistent disk (for example `/var/data/coderun.db`). Without one, SQLite lives on Render's ephemeral filesystem and accounts and history are lost on every deploy. |
+
+Render sets `RENDER=true` itself, which turns on Secure cookies and proxy-header handling. On other hosts set `APP_ENV=production`. See `.env.example` for the overrides.
+
 ## Run tests
 
 ```powershell
 pytest -q
 ```
 
-The test suite simulates Judge0's real `POST /submissions` followed by `GET /submissions/{token}` protocol. It verifies persistence, restore/delete behavior, validation, and API-failure recording without executing a program locally or requiring external network access.
+The test suite simulates Judge0's real `POST /submissions` followed by `GET /submissions/{token}` protocol. It verifies persistence, restore/delete behavior, validation, and API-failure recording without executing a program locally or requiring external network access. `tests/test_security.py` covers CSRF validation, the login/register flow, per-account history isolation, production cookie flags over HTTPS, and that Flask never spawns a process to run submitted code.
 
 ## Judge0 behavior
 

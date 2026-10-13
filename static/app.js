@@ -10,6 +10,7 @@ const historyList = document.getElementById("history-list");
 const historyEmpty = document.getElementById("history-empty");
 const historyCount = document.getElementById("history-count");
 const historyPanel = document.getElementById("history-panel");
+const historyAuth = document.getElementById("history-auth");
 const toast = document.getElementById("toast");
 const javaFileNote = document.getElementById("java-file-note");
 
@@ -43,10 +44,33 @@ function showResult(run) {
   metrics.hidden = !items.length;
 }
 
-async function request(url, options = {}) {
-  const response = await fetch(url, options);
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+let csrfToken = csrfMeta ? csrfMeta.content : "";
+let isAuthenticated = window.CODERUN_AUTHENTICATED === true;
+
+class RequestError extends Error {
+  constructor(message, status, code) { super(message); this.name = "RequestError"; this.status = status; this.code = code; }
+}
+
+// Ask the server for a fresh token, e.g. when the session cookie expired while the tab stayed open.
+async function refreshCsrfToken() {
+  const response = await fetch("/api/csrf", { credentials: "same-origin", headers: { Accept: "application/json" } });
+  if (!response.ok) throw new RequestError(`Could not refresh the security token (${response.status}).`, response.status);
+  csrfToken = (await response.json()).csrf_token;
+}
+
+async function request(url, options = {}, isRetry = false) {
+  const method = (options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!SAFE_METHODS.has(method) && csrfToken) headers.set("X-CSRFToken", csrfToken);
+  const response = await fetch(url, { ...options, headers, credentials: "same-origin" });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    // The server rejects a bad token before running anything, so retrying once with a fresh token is safe.
+    if (response.status === 400 && body.code === "csrf_failed" && !isRetry) { await refreshCsrfToken(); return request(url, options, true); }
+    throw new RequestError(body.error || `Request failed (${response.status})`, response.status, body.code);
+  }
   return body;
 }
 
@@ -80,13 +104,27 @@ function historyItem(run) {
   return article;
 }
 
+function showSignInPrompt() {
+  historyList.replaceChildren();
+  historyCount.textContent = "0";
+  historyEmpty.hidden = true;
+  historyAuth.hidden = false;
+}
+
 async function loadHistory() {
+  if (!isAuthenticated) { showSignInPrompt(); return; }
   try {
     const runs = await request("/api/history");
+    historyAuth.hidden = true;
     historyList.replaceChildren(...runs.map(historyItem));
     historyCount.textContent = runs.length;
+    historyEmpty.textContent = "Your runs will appear here.";
     historyEmpty.hidden = runs.length > 0;
-  } catch (error) { historyEmpty.textContent = `Could not load history: ${error.message}`; }
+  } catch (error) {
+    if (error.status === 401) { isAuthenticated = false; showSignInPrompt(); return; } // session expired: ask the user to sign in again
+    historyEmpty.hidden = false;
+    historyEmpty.textContent = `Could not load history: ${error.message}`;
+  }
 }
 
 async function runCode() {

@@ -7,24 +7,9 @@ import pytest
 import requests
 
 from app import create_app, find_java_public_class
+from helpers import CsrfClient, encoded_judge_result, sign_in, sign_up
 
-
-def encoded_judge_result(result):
-    """Create the text shape returned by Judge0 with base64_encoded=true."""
-    return {
-        key: base64.b64encode(value.encode("utf-8")).decode("ascii")
-        if key in {"stdout", "stderr", "compile_output", "message"} and isinstance(value, str)
-        else value
-        for key, value in result.items()
-    }
-
-
-@pytest.fixture()
-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "history.db")})
-    app.execute_judge = None  # Document that execution is patched below, not local.
-    with app.test_client() as client:
-        yield client, app
+# The `client` fixture (see conftest.py) is a signed-in, CSRF-aware browser, because history is per account.
 
 
 def fake_result(source_code, language, stdin):
@@ -93,12 +78,17 @@ def test_history_survives_a_new_backend_instance(tmp_path: Path, monkeypatch):
         "app.requests.request",
         lambda method, url, **kwargs: Response({"token": "restart"}) if method == "POST" else Response(encoded_judge_result({"stdout": "persisted\n", "status": {"id": 3, "description": "Accepted"}})),
     )
-    first_app = create_app({"TESTING": True, "DATABASE": database})
-    with first_app.test_client() as first_client:
+    config = {"TESTING": True, "DATABASE": database, "SECRET_KEY": "test-only-secret-key-never-used-in-production"}
+    first_app = create_app(config)
+    with first_app.test_client() as raw:
+        first_client = CsrfClient(raw)
+        sign_up(first_client, "ada")
         response = first_client.post("/api/execute", json={"source_code": "print('persisted')", "language": "python", "stdin": ""})
         assert response.status_code == 200
-    restarted_app = create_app({"TESTING": True, "DATABASE": database})
-    with restarted_app.test_client() as restarted_client:
+    restarted_app = create_app(config)
+    with restarted_app.test_client() as raw:
+        restarted_client = CsrfClient(raw)
+        sign_in(restarted_client, "ada")  # accounts and history live in SQLite, so they survive a restart
         history = restarted_client.get("/api/history").get_json()
     assert len(history) == 1
     assert history[0]["status"] == "Accepted"

@@ -12,7 +12,7 @@ import sqlite3
 import time
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +20,7 @@ from typing import Any, Callable
 import requests
 from dotenv import load_dotenv
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,6 +37,8 @@ JUDGE0_TEXT_FIELDS = ("stdout", "stderr", "compile_output", "message")
 JAVA_CLASS_MODIFIERS = {"abstract", "final", "sealed", "strictfp"}
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+# The old hardcoded fallback key. It is public, so it is treated as "not set".
+INSECURE_SECRET_KEYS = {"", "local-development-change-this-secret", "change-me", "changeme"}
 
 class ExecutorConfigurationError(RuntimeError):
     pass
@@ -44,6 +47,15 @@ class ExecutorConfigurationError(RuntimeError):
 class JavaPublicClass:
     name: str
     package_name: str | None
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip(): return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def running_in_production() -> bool:
+    """Render sets RENDER=true automatically; APP_ENV=production works on any other host."""
+    return env_flag("RENDER") or os.environ.get("APP_ENV", "").strip().lower() == "production"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -133,8 +145,19 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_user ON bookmarks(user_id,created_at DE
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
-    app.config.from_mapping(DATABASE=os.environ.get("DATABASE_PATH", str(BASE_DIR / "coderun.db")),SECRET_KEY=os.environ.get("SECRET_KEY", "local-development-change-this-secret"),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() in {"1","true","yes"},MAX_CONTENT_LENGTH=int(os.environ.get("MAX_REQUEST_BYTES", "250000")),CSRF_ENABLED=True,JUDGE0_API_URL=os.environ.get("JUDGE0_API_URL", "https://ce.judge0.com").rstrip("/"),JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID=optional_positive_int(os.environ.get("JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID", "89"), "JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID"),JUDGE0_AUTH_TOKEN=os.environ.get("JUDGE0_AUTH_TOKEN") or os.environ.get("JUDGE0_API_KEY", ""),JUDGE0_AUTH_USER=os.environ.get("JUDGE0_AUTH_USER", ""),JUDGE0_REQUEST_TIMEOUT=float(os.environ.get("JUDGE0_REQUEST_TIMEOUT", "15")),JUDGE0_POLL_INTERVAL=float(os.environ.get("JUDGE0_POLL_INTERVAL", "0.75")),JUDGE0_MAX_WAIT=float(os.environ.get("JUDGE0_MAX_WAIT", "25")),HISTORY_LIMIT=int(os.environ.get("HISTORY_LIMIT", "100")))
+    production = running_in_production()
+    app.config.from_mapping(DATABASE=os.environ.get("DATABASE_PATH", str(BASE_DIR / "coderun.db")),SECRET_KEY=os.environ.get("SECRET_KEY", "").strip(),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=env_flag("SESSION_COOKIE_SECURE", production),PERMANENT_SESSION_LIFETIME=timedelta(days=14),PREFERRED_URL_SCHEME="https" if production else "http",MAX_CONTENT_LENGTH=int(os.environ.get("MAX_REQUEST_BYTES", "250000")),CSRF_ENABLED=True,JUDGE0_API_URL=os.environ.get("JUDGE0_API_URL", "https://ce.judge0.com").rstrip("/"),JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID=optional_positive_int(os.environ.get("JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID", "89"), "JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID"),JUDGE0_AUTH_TOKEN=os.environ.get("JUDGE0_AUTH_TOKEN") or os.environ.get("JUDGE0_API_KEY", ""),JUDGE0_AUTH_USER=os.environ.get("JUDGE0_AUTH_USER", ""),JUDGE0_REQUEST_TIMEOUT=float(os.environ.get("JUDGE0_REQUEST_TIMEOUT", "15")),JUDGE0_POLL_INTERVAL=float(os.environ.get("JUDGE0_POLL_INTERVAL", "0.75")),JUDGE0_MAX_WAIT=float(os.environ.get("JUDGE0_MAX_WAIT", "25")),HISTORY_LIMIT=int(os.environ.get("HISTORY_LIMIT", "100")))
     if test_config: app.config.update(test_config)
+    if app.config["SECRET_KEY"] in INSECURE_SECRET_KEYS:
+        # Never fall back to a known key in production: anyone could forge a signed session cookie.
+        if production and not app.config.get("TESTING"):
+            raise RuntimeError("SECRET_KEY is not set. Add a long random SECRET_KEY environment variable (for example the output of `python -c \"import secrets; print(secrets.token_hex(32))\"`) before starting CodeRun in production.")
+        # Local development only: a random per-process key. Sessions reset whenever the server restarts.
+        app.config["SECRET_KEY"] = secrets.token_hex(32)
+        app.logger.warning("SECRET_KEY is not set; using a temporary random key. Sessions will reset on restart.")
+    if env_flag("TRUST_PROXY", production):
+        # Render terminates HTTPS at its proxy; honour X-Forwarded-For/Proto so Flask sees the real client and scheme.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # type: ignore[method-assign]
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
 
     @app.teardown_appcontext
@@ -182,14 +205,26 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if request.method not in {"POST","PUT","PATCH","DELETE"} or not app.config["CSRF_ENABLED"]: return None
         submitted = request.headers.get("X-CSRFToken") or request.form.get("csrf_token"); expected = session.get("csrf_token")
         if not expected or not submitted or not secrets.compare_digest(str(expected),str(submitted)):
-            return (jsonify(error="Invalid or missing CSRF token."),400) if request.path.startswith("/api/") else abort(400,"Invalid or missing CSRF token.")
+            return (jsonify(error="Invalid or missing CSRF token.",code="csrf_failed"),400) if request.path.startswith("/api/") else abort(400,"Invalid or missing CSRF token.")
         return None
+    @app.after_request
+    def no_store_dynamic_responses(response: Any) -> Any:
+        # Pages embed the session's CSRF token and API responses are per-user, so neither may be cached or shared.
+        if request.endpoint != "static" and response.mimetype in {"text/html","application/json"}: response.headers.setdefault("Cache-Control","no-store")
+        return response
     def login_required(view: Callable[...,Any]) -> Callable[...,Any]:
         @wraps(view)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             if get_user() is None: return (jsonify(error="Authentication required."),401) if request.path.startswith("/api/") else redirect(url_for("login",next=request.full_path))
             return view(*args,**kwargs)
         return wrapped
+    def home_endpoint() -> str:
+        # The DSA dashboard is optional; fall back to the compiler when its template is not deployed.
+        return "dashboard" if "dashboard.html" in app.jinja_env.list_templates() else "compiler"
+    def safe_next(default_endpoint: str) -> str:
+        destination = request.args.get("next","")
+        if destination.startswith("/") and not destination.startswith("//") and "\\" not in destination and "\n" not in destination and "\r" not in destination: return destination
+        return url_for(default_endpoint)
     def request_json() -> dict[str,Any] | tuple[Any,int]:
         payload=request.get_json(silent=True)
         return payload if isinstance(payload,dict) else (jsonify(error="Send a JSON request body."),400)
@@ -274,10 +309,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         value=dict(row); value["problem_title"]=get_db().execute("SELECT title FROM problems WHERE id=?",(row["problem_id"],)).fetchone()["title"]; return value
 
     @app.get("/")
-    def index() -> Any: return redirect(url_for("dashboard" if get_user() else "compiler"))
+    def index() -> Any: return redirect(url_for(home_endpoint() if get_user() else "compiler"))
     @app.route("/register",methods=["GET","POST"])
     def register() -> Any:
-        if get_user(): return redirect(url_for("dashboard"))
+        if get_user(): return redirect(url_for(home_endpoint()))
         error=None
         if request.method=="POST":
             username=request.form.get("username","").strip(); email=request.form.get("email","").strip().lower(); password=request.form.get("password","")
@@ -286,17 +321,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             elif len(password)<8: error="Password must be at least 8 characters."
             elif get_db().execute("SELECT 1 FROM users WHERE username=? OR email=?",(username,email)).fetchone(): error="That username or email is already registered."
             if error is None:
-                now=utc_now(); cursor=get_db().execute("INSERT INTO users(username,email,password_hash,created_at,updated_at) VALUES(?,?,?,?,?)",(username,email,generate_password_hash(password),now,now)); get_db().commit(); session.clear(); session["user_id"]=int(cursor.lastrowid); csrf_token(); return redirect(url_for("dashboard"))
+                now=utc_now(); cursor=get_db().execute("INSERT INTO users(username,email,password_hash,created_at,updated_at) VALUES(?,?,?,?,?)",(username,email,generate_password_hash(password),now,now)); get_db().commit(); session.clear(); session.permanent=True; session["user_id"]=int(cursor.lastrowid); csrf_token(); return redirect(url_for(home_endpoint()))
         return render_template("register.html",error=error)
     @app.route("/login",methods=["GET","POST"])
     def login() -> Any:
-        if get_user(): return redirect(url_for("dashboard"))
+        if get_user(): return redirect(safe_next(home_endpoint()))
         error=None
         if request.method=="POST":
             identity=request.form.get("identity","").strip(); password=request.form.get("password",""); user=get_db().execute("SELECT * FROM users WHERE username=? OR email=?",(identity,identity.lower())).fetchone()
             if user is None or not check_password_hash(user["password_hash"],password): error="Incorrect username/email or password."
             else:
-                session.clear(); session["user_id"]=user["id"]; csrf_token(); destination=request.args.get("next",""); return redirect(destination if destination.startswith("/") and not destination.startswith("//") else url_for("dashboard"))
+                session.clear(); session.permanent=True; session["user_id"]=user["id"]; csrf_token(); return redirect(safe_next(home_endpoint()))
         return render_template("login.html",error=error)
     @app.post("/logout")
     @login_required
@@ -331,13 +366,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def bookmarks_page() -> str: return render_template("bookmarks.html",problems=[serialize_problem(row,get_user()["id"]) for row in get_db().execute("SELECT p.* FROM problems p JOIN bookmarks b ON b.problem_id=p.id WHERE b.user_id=? ORDER BY b.created_at DESC",(get_user()["id"],))])
     @app.get("/progress")
     @login_required
-    def progress_page() -> Any: return redirect(url_for("dashboard"))
+    def progress_page() -> Any: return redirect(url_for(home_endpoint()))
     @app.get("/history")
     @login_required
     def history_page() -> str: return render_template("history.html")
     @app.get("/profile")
     @login_required
     def profile() -> str: return render_template("profile.html")
+    @app.get("/api/csrf")
+    def csrf_endpoint() -> Any:
+        # Same-origin JavaScript uses this to recover from an expired session. Cross-origin pages cannot read the response.
+        return jsonify(csrf_token=csrf_token())
     @app.get("/api/languages")
     def languages() -> Any: return jsonify(LANGUAGES)
     @app.get("/api/me")

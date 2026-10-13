@@ -4,20 +4,36 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10151f">
+  <meta name="csrf-token" content="{{ csrf_token }}">
   <title>CodeRun — Online Compiler</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='java-note.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="CodeRun home"><span class="brand-mark">&gt;_</span> CodeRun</a>
     <span class="tagline">Online Compiler <span aria-hidden="true">·</span> Execution History</span>
+    <nav class="auth-nav" aria-label="Account">
+      {% if current_user %}
+      <span class="auth-user" title="Signed in">{{ current_user.username }}</span>
+      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="auth-link">Sign out</button></form>
+      {% else %}
+      <a class="auth-link" href="{{ url_for('login', next=url_for('compiler')) }}">Sign in</a>
+      <a class="auth-link auth-link-primary" href="{{ url_for('register') }}">Create account</a>
+      {% endif %}
+    </nav>
     <button id="history-toggle" class="icon-button mobile-only" aria-label="Toggle execution history">☰</button>
   </header>
   <main class="app-shell">
     <aside id="history-panel" class="history-panel" aria-label="Execution history">
       <div class="panel-heading"><div><p class="eyebrow">Local SQLite</p><h2>Run history</h2></div><span id="history-count" class="count">0</span></div>
-      <p id="history-empty" class="empty-message">Your runs will appear here.</p>
+      <p id="history-empty" class="empty-message"{% if not current_user %} hidden{% endif %}>Your runs will appear here.</p>
+      <div id="history-auth" class="auth-prompt"{% if current_user %} hidden{% endif %}>
+        <strong>Sign in to see your run history</strong>
+        <p>Guests can run code, but runs are not saved. Sign in to keep a private history of your executions.</p>
+        <div class="auth-prompt-actions"><a class="auth-link auth-link-primary" href="{{ url_for('login', next=url_for('compiler')) }}">Sign in</a><a class="auth-link" href="{{ url_for('register') }}">Create account</a></div>
+      </div>
       <div id="history-list" class="history-list"></div>
     </aside>
     <section class="workspace">
@@ -47,7 +63,7 @@
     </section>
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script>window.CODERUN_LANGUAGES = {{ languages | tojson }}; window.MONACO_VS_PATH = {{ url_for('static', filename='vendor/monaco/vs') | tojson }};</script>
+  <script>window.CODERUN_AUTHENTICATED = {{ 'true' if current_user is not none else 'false' }}; window.CODERUN_LANGUAGES = {{ languages | tojson }}; window.MONACO_VS_PATH = {{ url_for('static', filename='vendor/monaco/vs') | tojson }};</script>
   <script src="{{ url_for('static', filename='vendor/monaco/vs/loader.js') }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

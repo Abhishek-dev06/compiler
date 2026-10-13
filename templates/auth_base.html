@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10151f">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}CodeRun{% endblock %} — CodeRun</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('compiler') }}" aria-label="CodeRun home"><span class="brand-mark">&gt;_</span> CodeRun</a>
+    <span class="tagline">Online Compiler <span aria-hidden="true">·</span> Execution History</span>
+  </header>
+  <main class="auth-page">
+    <section class="card auth-card">
+      {% block content %}{% endblock %}
+    </section>
+  </main>
+</body>
+</html>

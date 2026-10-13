@@ -1,0 +1,929 @@
+diff --git a/.env.example b/.env.example
+index 1e7db84..228fd66 100644
+--- a/.env.example
++++ b/.env.example
+@@ -10,6 +10,18 @@ JUDGE0_AUTH_TOKEN=
+ JUDGE0_AUTH_USER=
+ # JUDGE0_API_KEY= is also accepted as a backwards-compatible token alias.
+ 
++# REQUIRED in production (Render sets RENDER=true, and the app refuses to start without it).
++# Signs session cookies, so use a long random value and never commit it:
++#   python -c "import secrets; print(secrets.token_hex(32))"
++# Optional locally: when empty, a temporary random key is used and sessions reset on restart.
++SECRET_KEY=
++# Session cookies are Secure by default when RENDER=true or APP_ENV=production, and not otherwise.
++# Set to false only to test a production-mode build over plain http locally.
++# SESSION_COOKIE_SECURE=
++# APP_ENV=production
++# TRUST_PROXY defaults to on in production so Flask honours the HTTPS proxy's X-Forwarded-* headers.
++# TRUST_PROXY=
++
+ # Optional application settings
+ PORT=5000
+ FLASK_DEBUG=false
+diff --git a/README.md b/README.md
+index fb7b740..6953650 100644
+--- a/README.md
++++ b/README.md
+@@ -7,7 +7,7 @@ CodeRun is a dark, responsive Flask web application that uses **Judge0 CE** to c
+ - Locally bundled Monaco code editor (no browser-side CDN dependency), language selector, custom standard input, terminal output, and execution metrics.
+ - Python 3 (Judge0 ID 71), C GCC (50), C++ G++ (54), and Java. Java `public class Main` uses ID 62; other top-level public Java classes use Judge0's verified multi-file runner.
+ - Asynchronous Judge0 submit-and-poll protocol using Judge0's Base64 mode, preserving UTF-8 code (including Java generics) across the API boundary, plus remote timeout and API failure handling.
+-- SQLite-backed history that survives refreshes and backend restarts.
++- Accounts: guests can run code; signed-in users get a private, SQLite-backed run history that survives refreshes and restarts.
+ - Restore source/input/output from a historical run and delete individual records.
+ - Server-side environment configuration; browser code receives no Judge0 credentials.
+ 
+@@ -28,13 +28,31 @@ Open http://127.0.0.1:5000.
+ 
+ The default `.env.example` points at the public Judge0 CE instance. For a reliable production deployment, set `JUDGE0_API_URL` to a Judge0 CE deployment you control and, if it requires authentication, set `JUDGE0_AUTH_TOKEN` and/or `JUDGE0_AUTH_USER`. (`JUDGE0_API_KEY` is accepted as a token alias.) These values are read only on the backend. The default database is `coderun.db` next to `app.py`; set `DATABASE_PATH` for another persistent location.
+ 
++## Accounts, CSRF and sessions
++
++- **Guests** can run code, but runs are not saved. The history panel shows a sign-in prompt instead of an error.
++- **Signed-in users** (`/register`, `/login`) get a private run history. Every history query is scoped to the signed-in user, so one account can never read or delete another's runs.
++- **CSRF**: every `POST/PUT/PATCH/DELETE` must carry the session's token in an `X-CSRFToken` header (or a `csrf_token` form field). Pages embed it as `<meta name="csrf-token">`; `static/app.js` sends it automatically, and if the session expired while a tab was open it fetches a new token from `GET /api/csrf` and retries once.
++- **Sessions**: cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` in production. Logging in or registering starts a fresh session and a fresh CSRF token.
++
++### Production (Render)
++
++Set these environment variables on the service. `gunicorn app:app --bind 0.0.0.0:$PORT` is unchanged.
++
++| Variable | Value |
++| --- | --- |
++| `SECRET_KEY` | **Required.** A long random string (`python -c "import secrets; print(secrets.token_hex(32))"`). The app refuses to start in production without it. |
++| `DATABASE_PATH` | Recommended: a path on a persistent disk (for example `/var/data/coderun.db`). Without one, SQLite lives on Render's ephemeral filesystem and accounts and history are lost on every deploy. |
++
++Render sets `RENDER=true` itself, which turns on Secure cookies and proxy-header handling. On other hosts set `APP_ENV=production`. See `.env.example` for the overrides.
++
+ ## Run tests
+ 
+ ```powershell
+ pytest -q
+ ```
+ 
+-The test suite simulates Judge0's real `POST /submissions` followed by `GET /submissions/{token}` protocol. It verifies persistence, restore/delete behavior, validation, and API-failure recording without executing a program locally or requiring external network access.
++The test suite simulates Judge0's real `POST /submissions` followed by `GET /submissions/{token}` protocol. It verifies persistence, restore/delete behavior, validation, and API-failure recording without executing a program locally or requiring external network access. `tests/test_security.py` covers CSRF validation, the login/register flow, per-account history isolation, production cookie flags over HTTPS, and that Flask never spawns a process to run submitted code.
+ 
+ ## Judge0 behavior
+ 
+diff --git a/app.py b/app.py
+index 8ff3846..05cf0d5 100644
+--- a/app.py
++++ b/app.py
+@@ -12,7 +12,7 @@ import sqlite3
+ import time
+ import zipfile
+ from dataclasses import dataclass
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from functools import wraps
+ from pathlib import Path
+ from typing import Any, Callable
+@@ -20,6 +20,7 @@ from typing import Any, Callable
+ import requests
+ from dotenv import load_dotenv
+ from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
++from werkzeug.middleware.proxy_fix import ProxyFix
+ from werkzeug.security import check_password_hash, generate_password_hash
+ 
+ BASE_DIR = Path(__file__).resolve().parent
+@@ -36,6 +37,8 @@ JUDGE0_TEXT_FIELDS = ("stdout", "stderr", "compile_output", "message")
+ JAVA_CLASS_MODIFIERS = {"abstract", "final", "sealed", "strictfp"}
+ USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+ EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
++# The old hardcoded fallback key. It is public, so it is treated as "not set".
++INSECURE_SECRET_KEYS = {"", "local-development-change-this-secret", "change-me", "changeme"}
+ 
+ class ExecutorConfigurationError(RuntimeError):
+     pass
+@@ -45,6 +48,15 @@ class JavaPublicClass:
+     name: str
+     package_name: str | None
+ 
++def env_flag(name: str, default: bool = False) -> bool:
++    value = os.environ.get(name)
++    if value is None or not value.strip(): return default
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++def running_in_production() -> bool:
++    """Render sets RENDER=true automatically; APP_ENV=production works on any other host."""
++    return env_flag("RENDER") or os.environ.get("APP_ENV", "").strip().lower() == "production"
++
+ def utc_now() -> str:
+     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+ 
+@@ -133,8 +145,19 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_user ON bookmarks(user_id,created_at DE
+ 
+ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+     app = Flask(__name__)
+-    app.config.from_mapping(DATABASE=os.environ.get("DATABASE_PATH", str(BASE_DIR / "coderun.db")),SECRET_KEY=os.environ.get("SECRET_KEY", "local-development-change-this-secret"),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() in {"1","true","yes"},MAX_CONTENT_LENGTH=int(os.environ.get("MAX_REQUEST_BYTES", "250000")),CSRF_ENABLED=True,JUDGE0_API_URL=os.environ.get("JUDGE0_API_URL", "https://ce.judge0.com").rstrip("/"),JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID=optional_positive_int(os.environ.get("JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID", "89"), "JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID"),JUDGE0_AUTH_TOKEN=os.environ.get("JUDGE0_AUTH_TOKEN") or os.environ.get("JUDGE0_API_KEY", ""),JUDGE0_AUTH_USER=os.environ.get("JUDGE0_AUTH_USER", ""),JUDGE0_REQUEST_TIMEOUT=float(os.environ.get("JUDGE0_REQUEST_TIMEOUT", "15")),JUDGE0_POLL_INTERVAL=float(os.environ.get("JUDGE0_POLL_INTERVAL", "0.75")),JUDGE0_MAX_WAIT=float(os.environ.get("JUDGE0_MAX_WAIT", "25")),HISTORY_LIMIT=int(os.environ.get("HISTORY_LIMIT", "100")))
++    production = running_in_production()
++    app.config.from_mapping(DATABASE=os.environ.get("DATABASE_PATH", str(BASE_DIR / "coderun.db")),SECRET_KEY=os.environ.get("SECRET_KEY", "").strip(),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=env_flag("SESSION_COOKIE_SECURE", production),PERMANENT_SESSION_LIFETIME=timedelta(days=14),PREFERRED_URL_SCHEME="https" if production else "http",MAX_CONTENT_LENGTH=int(os.environ.get("MAX_REQUEST_BYTES", "250000")),CSRF_ENABLED=True,JUDGE0_API_URL=os.environ.get("JUDGE0_API_URL", "https://ce.judge0.com").rstrip("/"),JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID=optional_positive_int(os.environ.get("JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID", "89"), "JUDGE0_JAVA_MULTIFILE_LANGUAGE_ID"),JUDGE0_AUTH_TOKEN=os.environ.get("JUDGE0_AUTH_TOKEN") or os.environ.get("JUDGE0_API_KEY", ""),JUDGE0_AUTH_USER=os.environ.get("JUDGE0_AUTH_USER", ""),JUDGE0_REQUEST_TIMEOUT=float(os.environ.get("JUDGE0_REQUEST_TIMEOUT", "15")),JUDGE0_POLL_INTERVAL=float(os.environ.get("JUDGE0_POLL_INTERVAL", "0.75")),JUDGE0_MAX_WAIT=float(os.environ.get("JUDGE0_MAX_WAIT", "25")),HISTORY_LIMIT=int(os.environ.get("HISTORY_LIMIT", "100")))
+     if test_config: app.config.update(test_config)
++    if app.config["SECRET_KEY"] in INSECURE_SECRET_KEYS:
++        # Never fall back to a known key in production: anyone could forge a signed session cookie.
++        if production and not app.config.get("TESTING"):
++            raise RuntimeError("SECRET_KEY is not set. Add a long random SECRET_KEY environment variable (for example the output of `python -c \"import secrets; print(secrets.token_hex(32))\"`) before starting CodeRun in production.")
++        # Local development only: a random per-process key. Sessions reset whenever the server restarts.
++        app.config["SECRET_KEY"] = secrets.token_hex(32)
++        app.logger.warning("SECRET_KEY is not set; using a temporary random key. Sessions will reset on restart.")
++    if env_flag("TRUST_PROXY", production):
++        # Render terminates HTTPS at its proxy; honour X-Forwarded-For/Proto so Flask sees the real client and scheme.
++        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # type: ignore[method-assign]
+     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
+ 
+     @app.teardown_appcontext
+@@ -182,14 +205,26 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+         if request.method not in {"POST","PUT","PATCH","DELETE"} or not app.config["CSRF_ENABLED"]: return None
+         submitted = request.headers.get("X-CSRFToken") or request.form.get("csrf_token"); expected = session.get("csrf_token")
+         if not expected or not submitted or not secrets.compare_digest(str(expected),str(submitted)):
+-            return (jsonify(error="Invalid or missing CSRF token."),400) if request.path.startswith("/api/") else abort(400,"Invalid or missing CSRF token.")
++            return (jsonify(error="Invalid or missing CSRF token.",code="csrf_failed"),400) if request.path.startswith("/api/") else abort(400,"Invalid or missing CSRF token.")
+         return None
++    @app.after_request
++    def no_store_dynamic_responses(response: Any) -> Any:
++        # Pages embed the session's CSRF token and API responses are per-user, so neither may be cached or shared.
++        if request.endpoint != "static" and response.mimetype in {"text/html","application/json"}: response.headers.setdefault("Cache-Control","no-store")
++        return response
+     def login_required(view: Callable[...,Any]) -> Callable[...,Any]:
+         @wraps(view)
+         def wrapped(*args: Any, **kwargs: Any) -> Any:
+             if get_user() is None: return (jsonify(error="Authentication required."),401) if request.path.startswith("/api/") else redirect(url_for("login",next=request.full_path))
+             return view(*args,**kwargs)
+         return wrapped
++    def home_endpoint() -> str:
++        # The DSA dashboard is optional; fall back to the compiler when its template is not deployed.
++        return "dashboard" if "dashboard.html" in app.jinja_env.list_templates() else "compiler"
++    def safe_next(default_endpoint: str) -> str:
++        destination = request.args.get("next","")
++        if destination.startswith("/") and not destination.startswith("//") and "\\" not in destination and "\n" not in destination and "\r" not in destination: return destination
++        return url_for(default_endpoint)
+     def request_json() -> dict[str,Any] | tuple[Any,int]:
+         payload=request.get_json(silent=True)
+         return payload if isinstance(payload,dict) else (jsonify(error="Send a JSON request body."),400)
+@@ -274,10 +309,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+         value=dict(row); value["problem_title"]=get_db().execute("SELECT title FROM problems WHERE id=?",(row["problem_id"],)).fetchone()["title"]; return value
+ 
+     @app.get("/")
+-    def index() -> Any: return redirect(url_for("dashboard" if get_user() else "compiler"))
++    def index() -> Any: return redirect(url_for(home_endpoint() if get_user() else "compiler"))
+     @app.route("/register",methods=["GET","POST"])
+     def register() -> Any:
+-        if get_user(): return redirect(url_for("dashboard"))
++        if get_user(): return redirect(url_for(home_endpoint()))
+         error=None
+         if request.method=="POST":
+             username=request.form.get("username","").strip(); email=request.form.get("email","").strip().lower(); password=request.form.get("password","")
+@@ -286,17 +321,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+             elif len(password)<8: error="Password must be at least 8 characters."
+             elif get_db().execute("SELECT 1 FROM users WHERE username=? OR email=?",(username,email)).fetchone(): error="That username or email is already registered."
+             if error is None:
+-                now=utc_now(); cursor=get_db().execute("INSERT INTO users(username,email,password_hash,created_at,updated_at) VALUES(?,?,?,?,?)",(username,email,generate_password_hash(password),now,now)); get_db().commit(); session.clear(); session["user_id"]=int(cursor.lastrowid); csrf_token(); return redirect(url_for("dashboard"))
++                now=utc_now(); cursor=get_db().execute("INSERT INTO users(username,email,password_hash,created_at,updated_at) VALUES(?,?,?,?,?)",(username,email,generate_password_hash(password),now,now)); get_db().commit(); session.clear(); session.permanent=True; session["user_id"]=int(cursor.lastrowid); csrf_token(); return redirect(url_for(home_endpoint()))
+         return render_template("register.html",error=error)
+     @app.route("/login",methods=["GET","POST"])
+     def login() -> Any:
+-        if get_user(): return redirect(url_for("dashboard"))
++        if get_user(): return redirect(safe_next(home_endpoint()))
+         error=None
+         if request.method=="POST":
+             identity=request.form.get("identity","").strip(); password=request.form.get("password",""); user=get_db().execute("SELECT * FROM users WHERE username=? OR email=?",(identity,identity.lower())).fetchone()
+             if user is None or not check_password_hash(user["password_hash"],password): error="Incorrect username/email or password."
+             else:
+-                session.clear(); session["user_id"]=user["id"]; csrf_token(); destination=request.args.get("next",""); return redirect(destination if destination.startswith("/") and not destination.startswith("//") else url_for("dashboard"))
++                session.clear(); session.permanent=True; session["user_id"]=user["id"]; csrf_token(); return redirect(safe_next(home_endpoint()))
+         return render_template("login.html",error=error)
+     @app.post("/logout")
+     @login_required
+@@ -331,13 +366,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+     def bookmarks_page() -> str: return render_template("bookmarks.html",problems=[serialize_problem(row,get_user()["id"]) for row in get_db().execute("SELECT p.* FROM problems p JOIN bookmarks b ON b.problem_id=p.id WHERE b.user_id=? ORDER BY b.created_at DESC",(get_user()["id"],))])
+     @app.get("/progress")
+     @login_required
+-    def progress_page() -> Any: return redirect(url_for("dashboard"))
++    def progress_page() -> Any: return redirect(url_for(home_endpoint()))
+     @app.get("/history")
+     @login_required
+     def history_page() -> str: return render_template("history.html")
+     @app.get("/profile")
+     @login_required
+     def profile() -> str: return render_template("profile.html")
++    @app.get("/api/csrf")
++    def csrf_endpoint() -> Any:
++        # Same-origin JavaScript uses this to recover from an expired session. Cross-origin pages cannot read the response.
++        return jsonify(csrf_token=csrf_token())
+     @app.get("/api/languages")
+     def languages() -> Any: return jsonify(LANGUAGES)
+     @app.get("/api/me")
+diff --git a/static/app.js b/static/app.js
+index 1c79aec..7ca0df0 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -10,6 +10,7 @@ const historyList = document.getElementById("history-list");
+ const historyEmpty = document.getElementById("history-empty");
+ const historyCount = document.getElementById("history-count");
+ const historyPanel = document.getElementById("history-panel");
++const historyAuth = document.getElementById("history-auth");
+ const toast = document.getElementById("toast");
+ const javaFileNote = document.getElementById("java-file-note");
+ 
+@@ -43,10 +44,33 @@ function showResult(run) {
+   metrics.hidden = !items.length;
+ }
+ 
+-async function request(url, options = {}) {
+-  const response = await fetch(url, options);
++const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
++const csrfMeta = document.querySelector('meta[name="csrf-token"]');
++let csrfToken = csrfMeta ? csrfMeta.content : "";
++let isAuthenticated = window.CODERUN_AUTHENTICATED === true;
++
++class RequestError extends Error {
++  constructor(message, status, code) { super(message); this.name = "RequestError"; this.status = status; this.code = code; }
++}
++
++// Ask the server for a fresh token, e.g. when the session cookie expired while the tab stayed open.
++async function refreshCsrfToken() {
++  const response = await fetch("/api/csrf", { credentials: "same-origin", headers: { Accept: "application/json" } });
++  if (!response.ok) throw new RequestError(`Could not refresh the security token (${response.status}).`, response.status);
++  csrfToken = (await response.json()).csrf_token;
++}
++
++async function request(url, options = {}, isRetry = false) {
++  const method = (options.method || "GET").toUpperCase();
++  const headers = new Headers(options.headers || {});
++  if (!SAFE_METHODS.has(method) && csrfToken) headers.set("X-CSRFToken", csrfToken);
++  const response = await fetch(url, { ...options, headers, credentials: "same-origin" });
+   const body = await response.json().catch(() => ({}));
+-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
++  if (!response.ok) {
++    // The server rejects a bad token before running anything, so retrying once with a fresh token is safe.
++    if (response.status === 400 && body.code === "csrf_failed" && !isRetry) { await refreshCsrfToken(); return request(url, options, true); }
++    throw new RequestError(body.error || `Request failed (${response.status})`, response.status, body.code);
++  }
+   return body;
+ }
+ 
+@@ -80,13 +104,27 @@ function historyItem(run) {
+   return article;
+ }
+ 
++function showSignInPrompt() {
++  historyList.replaceChildren();
++  historyCount.textContent = "0";
++  historyEmpty.hidden = true;
++  historyAuth.hidden = false;
++}
++
+ async function loadHistory() {
++  if (!isAuthenticated) { showSignInPrompt(); return; }
+   try {
+     const runs = await request("/api/history");
++    historyAuth.hidden = true;
+     historyList.replaceChildren(...runs.map(historyItem));
+     historyCount.textContent = runs.length;
++    historyEmpty.textContent = "Your runs will appear here.";
+     historyEmpty.hidden = runs.length > 0;
+-  } catch (error) { historyEmpty.textContent = `Could not load history: ${error.message}`; }
++  } catch (error) {
++    if (error.status === 401) { isAuthenticated = false; showSignInPrompt(); return; } // session expired: ask the user to sign in again
++    historyEmpty.hidden = false;
++    historyEmpty.textContent = `Could not load history: ${error.message}`;
++  }
+ }
+ 
+ async function runCode() {
+diff --git a/static/auth.css b/static/auth.css
+new file mode 100644
+index 0000000..00d3a1f
+--- /dev/null
++++ b/static/auth.css
+@@ -0,0 +1,41 @@
++/* Account UI: header nav, history sign-in prompt, and the login/register pages. */
++[hidden] { display: none !important; }
++
++.auth-nav { margin-left: auto; display: flex; align-items: center; gap: .55rem; }
++.auth-nav form { margin: 0; }
++.auth-nav + .icon-button { margin-left: .25rem; }
++.auth-user { color: var(--muted); font-size: .82rem; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.auth-link {
++  display: inline-block; padding: .38rem .72rem; border-radius: 7px; font: inherit; font-size: .82rem; font-weight: 650;
++  color: var(--text); background: transparent; border: 1px solid var(--border); text-decoration: none; cursor: pointer;
++}
++.auth-link:hover { border-color: var(--accent); color: #fff; }
++.auth-link-primary { border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; }
++.auth-link-primary:hover { filter: brightness(1.1); }
++
++.auth-prompt {
++  margin: 1.1rem .25rem; padding: .9rem; border: 1px solid var(--border); border-radius: 10px;
++  background: rgba(96, 165, 250, .08); color: #cbd8ee; font-size: .85rem; line-height: 1.5;
++}
++.auth-prompt strong { display: block; color: var(--text); }
++.auth-prompt p { margin: .35rem 0 .8rem; color: var(--muted); }
++.auth-prompt-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
++
++.auth-page { display: grid; place-items: start center; padding: clamp(1.5rem, 8vh, 5rem) 1rem; }
++.auth-card { width: min(100%, 26rem); padding: 1.6rem; }
++.auth-card h1 { margin: .15rem 0 1rem; font-size: 1.5rem; letter-spacing: -.02em; }
++.auth-form { display: flex; flex-direction: column; gap: .4rem; }
++.auth-form label { margin-top: .6rem; font-size: .8rem; font-weight: 650; color: var(--muted); }
++.auth-hint { font-weight: 400; }
++.auth-form input[type="text"], .auth-form input[type="email"], .auth-form input[type="password"] {
++  width: 100%; background: #0c121c; color: #e2e8f0; border: 1px solid #293548; border-radius: 8px;
++  padding: .65rem .75rem; font: inherit; outline: none;
++}
++.auth-form input:focus { border-color: var(--accent); }
++.auth-submit { margin: 1.1rem 0 0; padding: .7rem; width: 100%; }
++.auth-error { margin: 0 0 .8rem; padding: .6rem .75rem; border-radius: 8px; border: 1px solid rgba(251, 113, 133, .45); background: rgba(251, 113, 133, .1); color: #fecdd3; font-size: .85rem; }
++.auth-note { margin: 0 0 .8rem; color: var(--muted); font-size: .85rem; }
++.auth-switch { margin: 1.2rem 0 0; color: var(--muted); font-size: .82rem; }
++.auth-switch a { color: var(--accent); }
++
++@media (max-width: 760px) { .auth-user { display: none; } .auth-nav { gap: .35rem; } }
+diff --git a/templates/auth_base.html b/templates/auth_base.html
+new file mode 100644
+index 0000000..4ca79a5
+--- /dev/null
++++ b/templates/auth_base.html
+@@ -0,0 +1,23 @@
++<!doctype html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <meta name="theme-color" content="#10151f">
++  <meta name="csrf-token" content="{{ csrf_token }}">
++  <title>{% block title %}CodeRun{% endblock %} — CodeRun</title>
++  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
++  <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
++</head>
++<body>
++  <header class="topbar">
++    <a class="brand" href="{{ url_for('compiler') }}" aria-label="CodeRun home"><span class="brand-mark">&gt;_</span> CodeRun</a>
++    <span class="tagline">Online Compiler <span aria-hidden="true">·</span> Execution History</span>
++  </header>
++  <main class="auth-page">
++    <section class="card auth-card">
++      {% block content %}{% endblock %}
++    </section>
++  </main>
++</body>
++</html>
+diff --git a/templates/index.html b/templates/index.html
+index 2f8fab3..ac23572 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -4,20 +4,36 @@
+   <meta charset="utf-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1">
+   <meta name="theme-color" content="#10151f">
++  <meta name="csrf-token" content="{{ csrf_token }}">
+   <title>CodeRun — Online Compiler</title>
+   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+   <link rel="stylesheet" href="{{ url_for('static', filename='java-note.css') }}">
++  <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
+ </head>
+ <body>
+   <header class="topbar">
+     <a class="brand" href="/" aria-label="CodeRun home"><span class="brand-mark">&gt;_</span> CodeRun</a>
+     <span class="tagline">Online Compiler <span aria-hidden="true">·</span> Execution History</span>
++    <nav class="auth-nav" aria-label="Account">
++      {% if current_user %}
++      <span class="auth-user" title="Signed in">{{ current_user.username }}</span>
++      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="auth-link">Sign out</button></form>
++      {% else %}
++      <a class="auth-link" href="{{ url_for('login', next=url_for('compiler')) }}">Sign in</a>
++      <a class="auth-link auth-link-primary" href="{{ url_for('register') }}">Create account</a>
++      {% endif %}
++    </nav>
+     <button id="history-toggle" class="icon-button mobile-only" aria-label="Toggle execution history">☰</button>
+   </header>
+   <main class="app-shell">
+     <aside id="history-panel" class="history-panel" aria-label="Execution history">
+       <div class="panel-heading"><div><p class="eyebrow">Local SQLite</p><h2>Run history</h2></div><span id="history-count" class="count">0</span></div>
+-      <p id="history-empty" class="empty-message">Your runs will appear here.</p>
++      <p id="history-empty" class="empty-message"{% if not current_user %} hidden{% endif %}>Your runs will appear here.</p>
++      <div id="history-auth" class="auth-prompt"{% if current_user %} hidden{% endif %}>
++        <strong>Sign in to see your run history</strong>
++        <p>Guests can run code, but runs are not saved. Sign in to keep a private history of your executions.</p>
++        <div class="auth-prompt-actions"><a class="auth-link auth-link-primary" href="{{ url_for('login', next=url_for('compiler')) }}">Sign in</a><a class="auth-link" href="{{ url_for('register') }}">Create account</a></div>
++      </div>
+       <div id="history-list" class="history-list"></div>
+     </aside>
+     <section class="workspace">
+@@ -47,7 +63,7 @@
+     </section>
+   </main>
+   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+-  <script>window.CODERUN_LANGUAGES = {{ languages | tojson }}; window.MONACO_VS_PATH = {{ url_for('static', filename='vendor/monaco/vs') | tojson }};</script>
++  <script>window.CODERUN_AUTHENTICATED = {{ 'true' if current_user is not none else 'false' }}; window.CODERUN_LANGUAGES = {{ languages | tojson }}; window.MONACO_VS_PATH = {{ url_for('static', filename='vendor/monaco/vs') | tojson }};</script>
+   <script src="{{ url_for('static', filename='vendor/monaco/vs/loader.js') }}"></script>
+   <script src="{{ url_for('static', filename='app.js') }}"></script>
+ </body>
+diff --git a/templates/login.html b/templates/login.html
+new file mode 100644
+index 0000000..2e7003f
+--- /dev/null
++++ b/templates/login.html
+@@ -0,0 +1,18 @@
++{% extends "auth_base.html" %}
++{% block title %}Sign in{% endblock %}
++{% block content %}
++<p class="eyebrow">Welcome back</p>
++<h1>Sign in</h1>
++{% if request.args.get('next') %}<p class="auth-note">Sign in to continue.</p>{% endif %}
++{% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
++{# No action attribute: the form posts back to this exact URL, so ?next=... is preserved. #}
++<form method="post" class="auth-form">
++  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
++  <label for="identity">Username or email</label>
++  <input id="identity" name="identity" type="text" autocomplete="username" required autofocus value="{{ request.form.get('identity', '') }}">
++  <label for="password">Password</label>
++  <input id="password" name="password" type="password" autocomplete="current-password" required>
++  <button type="submit" class="run-button auth-submit">Sign in</button>
++</form>
++<p class="auth-switch">New to CodeRun? <a href="{{ url_for('register') }}">Create an account</a> · <a href="{{ url_for('compiler') }}">Continue as guest</a></p>
++{% endblock %}
+diff --git a/templates/register.html b/templates/register.html
+new file mode 100644
+index 0000000..3e7ea0a
+--- /dev/null
++++ b/templates/register.html
+@@ -0,0 +1,18 @@
++{% extends "auth_base.html" %}
++{% block title %}Create account{% endblock %}
++{% block content %}
++<p class="eyebrow">Save your runs</p>
++<h1>Create account</h1>
++{% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
++<form method="post" class="auth-form">
++  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
++  <label for="username">Username</label>
++  <input id="username" name="username" type="text" autocomplete="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_]{3,32}" autofocus value="{{ request.form.get('username', '') }}">
++  <label for="email">Email</label>
++  <input id="email" name="email" type="email" autocomplete="email" required value="{{ request.form.get('email', '') }}">
++  <label for="password">Password <span class="auth-hint">(8+ characters)</span></label>
++  <input id="password" name="password" type="password" autocomplete="new-password" required minlength="8">
++  <button type="submit" class="run-button auth-submit">Create account</button>
++</form>
++<p class="auth-switch">Already registered? <a href="{{ url_for('login') }}">Sign in</a> · <a href="{{ url_for('compiler') }}">Continue as guest</a></p>
++{% endblock %}
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..2ef6eec
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,30 @@
++import pytest
++
++from app import create_app
++from helpers import CsrfClient, sign_up
++
++TEST_SECRET = "test-only-secret-key-never-used-in-production"
++
++
++@pytest.fixture()
++def make_app(tmp_path):
++    """Build an isolated app (own SQLite file) with a fixed test secret."""
++    def factory(**config):
++        return create_app({"TESTING": True, "SECRET_KEY": TEST_SECRET, "DATABASE": str(tmp_path / "history.db"), **config})
++    return factory
++
++
++@pytest.fixture()
++def guest(make_app):
++    """An anonymous browser: has a session and CSRF token but is not signed in."""
++    app = make_app()
++    with app.test_client() as raw:
++        yield CsrfClient(raw), app
++
++
++@pytest.fixture()
++def client(guest):
++    """A signed-in browser. Most existing tests exercise history, which is per-account."""
++    client, app = guest
++    sign_up(client, "ada")
++    yield client, app
+diff --git a/tests/helpers.py b/tests/helpers.py
+new file mode 100644
+index 0000000..80050d7
+--- /dev/null
++++ b/tests/helpers.py
+@@ -0,0 +1,85 @@
++"""Shared test helpers: a CSRF-aware client that behaves like static/app.js, and a fake Judge0."""
++from __future__ import annotations
++
++import base64
++
++PASSWORD = "correct horse battery"
++
++
++class CsrfClient:
++    """Wraps Flask's test client and sends X-CSRFToken on unsafe methods, as the browser code does."""
++
++    def __init__(self, client):
++        self.raw = client
++        self.csrf_token: str | None = None
++
++    def __getattr__(self, name):  # get(), cookie_jar, etc. pass straight through
++        return getattr(self.raw, name)
++
++    def refresh_csrf(self, **kwargs) -> str:
++        self.csrf_token = self.raw.get("/api/csrf", **kwargs).get_json()["csrf_token"]
++        return self.csrf_token
++
++    def _unsafe(self, method: str, *args, **kwargs):
++        headers = dict(kwargs.pop("headers", None) or {})
++        if "X-CSRFToken" not in headers:
++            if self.csrf_token is None:
++                self.refresh_csrf()
++            headers["X-CSRFToken"] = self.csrf_token
++        return getattr(self.raw, method)(*args, headers=headers, **kwargs)
++
++    def post(self, *args, **kwargs): return self._unsafe("post", *args, **kwargs)
++    def put(self, *args, **kwargs): return self._unsafe("put", *args, **kwargs)
++    def patch(self, *args, **kwargs): return self._unsafe("patch", *args, **kwargs)
++    def delete(self, *args, **kwargs): return self._unsafe("delete", *args, **kwargs)
++
++
++def sign_up(client: CsrfClient, username: str = "ada", password: str = PASSWORD, **kwargs):
++    response = client.raw.post(
++        "/register",
++        data={"username": username, "email": f"{username}@example.com", "password": password, "csrf_token": client.refresh_csrf(**kwargs)},
++        **kwargs,
++    )
++    assert response.status_code == 302, response.get_data(as_text=True)
++    client.refresh_csrf(**kwargs)  # registering rotates the session, so the old token is no longer valid
++    return response
++
++
++def sign_in(client: CsrfClient, username: str = "ada", password: str = PASSWORD, **kwargs):
++    response = client.raw.post(
++        "/login",
++        data={"identity": username, "password": password, "csrf_token": client.refresh_csrf(**kwargs)},
++        **kwargs,
++    )
++    assert response.status_code == 302, response.get_data(as_text=True)
++    client.refresh_csrf(**kwargs)
++    return response
++
++
++def encoded_judge_result(result):
++    """Create the text shape returned by Judge0 with base64_encoded=true."""
++    return {
++        key: base64.b64encode(value.encode("utf-8")).decode("ascii")
++        if key in {"stdout", "stderr", "compile_output", "message"} and isinstance(value, str)
++        else value
++        for key, value in result.items()
++    }
++
++
++def install_fake_judge(monkeypatch, stdout: str = "Hello, World!\n"):
++    """Patch the requests boundary with a complete Judge0 submit-then-poll sequence. Returns the call log."""
++    calls: list[tuple[str, str]] = []
++
++    class Response:
++        def __init__(self, body): self.body = body
++        def raise_for_status(self): pass
++        def json(self): return self.body
++
++    def fake_request(method, url, **kwargs):
++        calls.append((method, url))
++        if method == "POST":
++            return Response({"token": "abc"})
++        return Response(encoded_judge_result({"stdout": stdout, "status": {"id": 3, "description": "Accepted"}, "time": "0.01", "memory": 8500}))
++
++    monkeypatch.setattr("app.requests.request", fake_request)
++    return calls
+diff --git a/tests/test_app.py b/tests/test_app.py
+index 9f25fad..b92406c 100644
+--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -7,24 +7,9 @@ import pytest
+ import requests
+ 
+ from app import create_app, find_java_public_class
++from helpers import CsrfClient, encoded_judge_result, sign_in, sign_up
+ 
+-
+-def encoded_judge_result(result):
+-    """Create the text shape returned by Judge0 with base64_encoded=true."""
+-    return {
+-        key: base64.b64encode(value.encode("utf-8")).decode("ascii")
+-        if key in {"stdout", "stderr", "compile_output", "message"} and isinstance(value, str)
+-        else value
+-        for key, value in result.items()
+-    }
+-
+-
+-@pytest.fixture()
+-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+-    app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "history.db")})
+-    app.execute_judge = None  # Document that execution is patched below, not local.
+-    with app.test_client() as client:
+-        yield client, app
++# The `client` fixture (see conftest.py) is a signed-in, CSRF-aware browser, because history is per account.
+ 
+ 
+ def fake_result(source_code, language, stdin):
+@@ -93,12 +78,17 @@ def test_history_survives_a_new_backend_instance(tmp_path: Path, monkeypatch):
+         "app.requests.request",
+         lambda method, url, **kwargs: Response({"token": "restart"}) if method == "POST" else Response(encoded_judge_result({"stdout": "persisted\n", "status": {"id": 3, "description": "Accepted"}})),
+     )
+-    first_app = create_app({"TESTING": True, "DATABASE": database})
+-    with first_app.test_client() as first_client:
++    config = {"TESTING": True, "DATABASE": database, "SECRET_KEY": "test-only-secret-key-never-used-in-production"}
++    first_app = create_app(config)
++    with first_app.test_client() as raw:
++        first_client = CsrfClient(raw)
++        sign_up(first_client, "ada")
+         response = first_client.post("/api/execute", json={"source_code": "print('persisted')", "language": "python", "stdin": ""})
+         assert response.status_code == 200
+-    restarted_app = create_app({"TESTING": True, "DATABASE": database})
+-    with restarted_app.test_client() as restarted_client:
++    restarted_app = create_app(config)
++    with restarted_app.test_client() as raw:
++        restarted_client = CsrfClient(raw)
++        sign_in(restarted_client, "ada")  # accounts and history live in SQLite, so they survive a restart
+         history = restarted_client.get("/api/history").get_json()
+     assert len(history) == 1
+     assert history[0]["status"] == "Accepted"
+diff --git a/tests/test_security.py b/tests/test_security.py
+new file mode 100644
+index 0000000..1be1a1a
+--- /dev/null
++++ b/tests/test_security.py
+@@ -0,0 +1,273 @@
++"""CSRF validation, authentication/history isolation, session cookies, and Judge0-only execution."""
++import re
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from app import create_app
++from conftest import TEST_SECRET
++from helpers import PASSWORD, CsrfClient, install_fake_judge, sign_in, sign_up
++
++RUN = {"source_code": "print('hi')", "language": "python", "stdin": ""}
++ROOT = Path(__file__).resolve().parent.parent
++
++
++# ---------------------------------------------------------------- CSRF validation
++
++def test_run_without_csrf_token_is_rejected_before_judge0(guest, monkeypatch):
++    client, _ = guest
++    calls = install_fake_judge(monkeypatch)
++    response = client.raw.post("/api/execute", json=RUN)  # no X-CSRFToken header
++    assert response.status_code == 400
++    assert response.get_json() == {"error": "Invalid or missing CSRF token.", "code": "csrf_failed"}
++    assert calls == []  # nothing was submitted to Judge0
++
++
++def test_run_with_wrong_csrf_token_is_rejected(guest, monkeypatch):
++    client, _ = guest
++    calls = install_fake_judge(monkeypatch)
++    client.refresh_csrf()
++    response = client.raw.post("/api/execute", json=RUN, headers={"X-CSRFToken": "not-the-session-token"})
++    assert response.status_code == 400 and response.get_json()["code"] == "csrf_failed"
++    assert calls == []
++
++
++def test_token_from_another_session_is_rejected(make_app, monkeypatch):
++    install_fake_judge(monkeypatch)
++    app = make_app()
++    first, second = app.test_client(), app.test_client()
++    stolen = first.get("/api/csrf").get_json()["csrf_token"]
++    second.get("/api/csrf")  # second browser has its own session and token
++    response = second.post("/api/execute", json=RUN, headers={"X-CSRFToken": stolen})
++    assert response.status_code == 400
++
++
++def test_run_with_valid_csrf_token_goes_through_judge0(guest, monkeypatch):
++    client, _ = guest
++    calls = install_fake_judge(monkeypatch, stdout="hi\n")
++    response = client.post("/api/execute", json=RUN)
++    assert response.status_code == 200
++    assert response.get_json()["status"] == "Accepted" and response.get_json()["stdout"] == "hi\n"
++    assert [method for method, _ in calls] == ["POST", "GET"]  # Judge0 submit, then poll
++
++
++def test_page_embeds_the_token_the_server_validates(guest, monkeypatch):
++    """The real browser flow: read the token from the page's meta tag and send it in X-CSRFToken."""
++    client, _ = guest
++    install_fake_judge(monkeypatch)
++    page = client.get("/compiler").get_data(as_text=True)
++    token = re.search(r'<meta name="csrf-token" content="([^"]+)"', page).group(1)
++    assert client.raw.post("/api/execute", json=RUN, headers={"X-CSRFToken": token}).status_code == 200
++
++
++def test_frontend_sends_the_header_the_backend_expects():
++    script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
++    assert "X-CSRFToken" in script and 'meta[name="csrf-token"]' in script and "/api/csrf" in script
++
++
++def test_every_unsafe_method_needs_a_token(client):
++    client, _ = client
++    assert client.raw.delete("/api/history/1").status_code == 400  # CSRF is checked before the 404
++    assert client.raw.post("/logout").status_code == 400
++    assert client.get("/api/history").status_code == 200  # safe methods are not affected
++
++
++def test_csrf_token_endpoint_is_per_session_and_not_cacheable(guest):
++    client, _ = guest
++    first = client.get("/api/csrf")
++    assert first.headers["Cache-Control"] == "no-store"
++    assert first.get_json()["csrf_token"] == client.get("/api/csrf").get_json()["csrf_token"]
++    assert client.get("/compiler").headers["Cache-Control"] == "no-store"
++
++
++# ---------------------------------------------------------------- history authentication
++
++def test_guest_can_run_code_but_nothing_is_saved(guest, monkeypatch):
++    client, _ = guest
++    install_fake_judge(monkeypatch)
++    run = client.post("/api/execute", json=RUN).get_json()
++    assert run["history_saved"] is False and run["id"] is None and run["status"] == "Accepted"
++
++
++def test_history_requires_authentication(guest):
++    client, _ = guest
++    for response in (client.get("/api/history"), client.get("/api/history/1"), client.delete("/api/history/1")):
++        assert response.status_code == 401
++        assert response.get_json() == {"error": "Authentication required."}
++
++
++def test_me_reports_guest_state_and_signed_in_state(guest):
++    client, _ = guest
++    assert client.get("/api/me").get_json()["authenticated"] is False
++    sign_up(client, "ada")
++    me = client.get("/api/me").get_json()
++    assert me["authenticated"] is True and me["user"]["username"] == "ada"
++
++
++def test_history_is_isolated_per_account(make_app, monkeypatch):
++    install_fake_judge(monkeypatch)
++    app = make_app()
++    alice, bob = CsrfClient(app.test_client()), CsrfClient(app.test_client())
++    sign_up(alice, "alice")
++    sign_up(bob, "bob")
++    alice_run = alice.post("/api/execute", json=RUN).get_json()
++    assert bob.get("/api/history").get_json() == []
++    assert bob.get(f"/api/history/{alice_run['id']}").status_code == 404
++    assert bob.delete(f"/api/history/{alice_run['id']}").status_code == 404
++    assert [run["id"] for run in alice.get("/api/history").get_json()] == [alice_run["id"]]
++
++
++def test_legacy_unowned_runs_are_never_exposed(client, monkeypatch):
++    client, app = client
++    with app.app_context():
++        import sqlite3
++        db = sqlite3.connect(app.config["DATABASE"])
++        db.execute("INSERT INTO executions(source_code,language,status,created_at,user_id) VALUES('secret','python','Accepted','2024-01-01',NULL)")
++        db.commit(); db.close()
++    assert client.get("/api/history").get_json() == []
++
++
++# ---------------------------------------------------------------- login / register flow
++
++def test_login_and_register_pages_render_with_a_csrf_field(guest):
++    client, _ = guest
++    for path in ("/login", "/register"):
++        response = client.get(path)
++        assert response.status_code == 200
++        assert 'name="csrf_token"' in response.get_data(as_text=True)
++
++
++def test_compiler_page_offers_sign_in_to_guests_and_sign_out_to_users(guest):
++    client, _ = guest
++    page = client.get("/compiler").get_data(as_text=True)
++    assert "Sign in to see your run history" in page and 'href="/login?next=/compiler"' in page
++    assert "window.CODERUN_AUTHENTICATED = false" in page
++    sign_up(client, "ada")
++    page = client.get("/compiler").get_data(as_text=True)
++    assert "Sign out" in page and "window.CODERUN_AUTHENTICATED = true" in page
++
++
++def test_login_post_without_csrf_is_rejected(guest):
++    client, _ = guest
++    sign_up(client, "ada")
++    client.raw.post("/logout", headers={"X-CSRFToken": client.csrf_token})
++    response = client.raw.post("/login", data={"identity": "ada", "password": PASSWORD})
++    assert response.status_code == 400
++
++
++def test_wrong_password_is_rejected_without_signing_in(guest):
++    client, _ = guest
++    sign_up(client, "ada")
++    client.post("/logout")
++    response = client.raw.post("/login", data={"identity": "ada", "password": "wrong-password", "csrf_token": client.refresh_csrf()})
++    assert response.status_code == 200 and "Incorrect username/email or password." in response.get_data(as_text=True)
++    assert client.get("/api/history").status_code == 401
++
++
++def test_login_rotates_the_csrf_token_and_logout_ends_the_session(guest):
++    client, _ = guest
++    sign_up(client, "ada")
++    client.post("/logout")
++    before = client.refresh_csrf()
++    sign_in(client, "ada")
++    assert client.csrf_token != before  # session fixation protection: new session, new token
++    assert client.get("/api/history").status_code == 200
++    assert client.post("/logout").status_code == 302
++    assert client.get("/api/history").status_code == 401
++
++
++def test_login_required_pages_redirect_to_login_and_return_to_next(guest):
++    client, _ = guest
++    redirect = client.get("/history")
++    assert redirect.status_code == 302 and "/login?next=" in redirect.headers["Location"]
++    sign_up(client, "ada")
++    client.post("/logout")
++    sign_in_response = client.raw.post("/login?next=/compiler", data={"identity": "ada", "password": PASSWORD, "csrf_token": client.refresh_csrf()})
++    assert sign_in_response.headers["Location"].endswith("/compiler")
++
++
++@pytest.mark.parametrize("target", ["//evil.example", "https://evil.example", "/\\evil.example", "javascript:alert(1)", "/ok\r\nSet-Cookie: x=1"])
++def test_login_ignores_unsafe_next_targets(guest, target):
++    client, _ = guest
++    sign_up(client, "ada")
++    client.post("/logout")
++    response = client.raw.post("/login", query_string={"next": target}, data={"identity": "ada", "password": PASSWORD, "csrf_token": client.refresh_csrf()})
++    assert response.status_code == 302 and response.headers["Location"].endswith("/compiler")
++
++
++def test_signed_in_user_is_not_sent_to_missing_dashboard_template(guest):
++    client, _ = guest
++    sign_up(client, "ada")
++    response = client.get("/")
++    assert response.status_code == 302 and response.headers["Location"].endswith("/compiler")  # no 500 from a missing template
++
++
++# ---------------------------------------------------------------- production cookies and secrets
++
++def production_env(monkeypatch, secret="x" * 48):
++    monkeypatch.setenv("RENDER", "true")
++    monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
++    monkeypatch.delenv("TRUST_PROXY", raising=False)
++    if secret is None: monkeypatch.delenv("SECRET_KEY", raising=False)
++    else: monkeypatch.setenv("SECRET_KEY", secret)
++
++
++@pytest.mark.parametrize("secret", [None, "", "local-development-change-this-secret"])
++def test_production_refuses_to_start_without_a_real_secret_key(tmp_path, monkeypatch, secret):
++    production_env(monkeypatch, secret)
++    with pytest.raises(RuntimeError, match="SECRET_KEY"):
++        create_app({"DATABASE": str(tmp_path / "x.db")})
++
++
++def test_development_uses_a_random_key_not_the_old_public_default(tmp_path, monkeypatch):
++    monkeypatch.delenv("RENDER", raising=False); monkeypatch.delenv("APP_ENV", raising=False); monkeypatch.delenv("SECRET_KEY", raising=False)
++    first = create_app({"DATABASE": str(tmp_path / "a.db")}); second = create_app({"DATABASE": str(tmp_path / "b.db")})
++    assert first.config["SECRET_KEY"] != second.config["SECRET_KEY"]
++    assert first.config["SECRET_KEY"] != "local-development-change-this-secret"
++    assert first.config["SESSION_COOKIE_SECURE"] is False  # plain-http local development keeps working
++
++
++def test_production_cookie_is_secure_httponly_samesite_and_works_over_https(tmp_path, monkeypatch):
++    production_env(monkeypatch)
++    install_fake_judge(monkeypatch)
++    app = create_app({"DATABASE": str(tmp_path / "prod.db")})
++    assert app.config["SESSION_COOKIE_SECURE"] is True
++    https = {"base_url": "https://coderun.example", "headers": {"X-Forwarded-Proto": "https"}}
++    with app.test_client() as raw:
++        client = CsrfClient(raw)
++        cookie = raw.get("/compiler", **https).headers["Set-Cookie"]
++        assert "Secure" in cookie and "HttpOnly" in cookie and "SameSite=Lax" in cookie
++        # Full flow over HTTPS: token -> register -> run -> history.
++        client.refresh_csrf(**https)
++        response = raw.post("/register", data={"username": "ada", "email": "ada@example.com", "password": PASSWORD, "csrf_token": client.csrf_token}, **https)
++        assert response.status_code == 302
++        client.refresh_csrf(**https)
++        run = raw.post("/api/execute", json=RUN, headers={"X-CSRFToken": client.csrf_token, "X-Forwarded-Proto": "https"}, base_url="https://coderun.example")
++        assert run.status_code == 200 and run.get_json()["history_saved"] is True
++        assert len(raw.get("/api/history", **https).get_json()) == 1
++
++
++def test_secure_cookie_can_be_overridden_for_local_https_testing(tmp_path, monkeypatch):
++    production_env(monkeypatch)
++    monkeypatch.setenv("SESSION_COOKIE_SECURE", "false")
++    assert create_app({"DATABASE": str(tmp_path / "p.db")}).config["SESSION_COOKIE_SECURE"] is False
++
++
++# ---------------------------------------------------------------- code execution stays on Judge0
++
++def test_flask_never_spawns_a_process_to_run_submitted_code(client, monkeypatch):
++    client, _ = client
++    install_fake_judge(monkeypatch)
++    def forbidden(*args, **kwargs): raise AssertionError("submitted code must only run on Judge0")
++    for name in ("run", "Popen", "call", "check_output", "check_call"):
++        monkeypatch.setattr(subprocess, name, forbidden)
++    monkeypatch.setattr("os.system", forbidden)
++    assert client.post("/api/execute", json={"source_code": "import os; os.system('id')", "language": "python", "stdin": ""}).status_code == 200
++
++
++def test_execute_validates_input_after_csrf(guest):
++    client, _ = guest
++    assert client.post("/api/execute", json={"source_code": "", "language": "python"}).status_code == 400
++    assert client.post("/api/execute", json={"source_code": "x", "language": "brainfuck"}).status_code == 400
++    assert client.post("/api/execute", data="not json", headers={"Content-Type": "text/plain"}).status_code == 400

@@ -1,0 +1,18 @@
+{% extends "auth_base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<p class="eyebrow">Welcome back</p>
+<h1>Sign in</h1>
+{% if request.args.get('next') %}<p class="auth-note">Sign in to continue.</p>{% endif %}
+{% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
+{# No action attribute: the form posts back to this exact URL, so ?next=... is preserved. #}
+<form method="post" class="auth-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label for="identity">Username or email</label>
+  <input id="identity" name="identity" type="text" autocomplete="username" required autofocus value="{{ request.form.get('identity', '') }}">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit" class="run-button auth-submit">Sign in</button>
+</form>
+<p class="auth-switch">New to CodeRun? <a href="{{ url_for('register') }}">Create an account</a> · <a href="{{ url_for('compiler') }}">Continue as guest</a></p>
+{% endblock %}
